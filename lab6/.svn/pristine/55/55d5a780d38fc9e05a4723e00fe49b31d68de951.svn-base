@@ -1,0 +1,668 @@
+/*
+ * mm.c - Malloc implementation using segregated lists.
+ * Team: Jiefu Zhang, Jing Lu
+ * 
+ * Block structure:
+ *   1) Allocated blocks: [header][..payload...][footer]
+ *   2) Free blocks: [header][ptr][...payload...][footer]
+ * Header/Footer structure:
+ *   [size ... allocation bit]
+ * Each header and footer is standard(4-byte) and contains information 
+ * about block size and allocation bit. 
+ * 
+ * The free list uses explicit list structure 
+ * and the pointer in the free block points to next free block in the list.
+ * Also, we organize explicit free lists into segregated list. We add some pointers
+ * at the beginning of the heap to point to the first blocks in seglists of different sizes.
+ * 
+ * To search for a free block in the free list, we adopt best-fit search strategy.
+ * 
+ * Coalescing will be done every time after extending the heap and free operation.
+ *
+ * At the end, we have mm_check() to check several consistency conditions.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
+
+#include "mm.h"
+#include "memlib.h"
+
+/*********************************************************
+ * NOTE TO STUDENTS: Before you do anything else, please
+ * provide your team information in the following struct.
+ ********************************************************/
+team_t team = {
+    /* Team name */
+    "halloween",
+    /* First member's full name */
+    "Jiefu Zhang",
+    /* First member's email address */
+    "jeffzhang@wustl.edu",
+    /* Second member's full name (leave blank if none) */
+    "Jing Lu",
+    /* Second member's email address (leave blank if none) */
+    "jinglu@wustl.edu"
+};
+
+
+/* Basic constants and macros */
+#define WSIZE       4       /* Word and header/footer size (bytes) */
+#define DSIZE       8       /* Doubleword size (bytes) */
+#define CHUNKSIZE  (1<<12)  /* Extend heap by this amount (bytes) */
+#define OVERHEAD   8        /* Overhead of header and footer (bytes) */
+
+#define MAX(x, y) ((x) > (y)? (x) : (y))  
+
+/* Pack a size and allocated bit into a word */
+#define PACK(size, alloc)  ((size) | (alloc))
+
+/* Read and write a word at address p */
+#define GET(p)       (*(unsigned int *)(p))
+#define PUT(p, val)  (*(unsigned int *)(p) = (val))
+
+/* Read and write a pointer at address p */
+#define GET_PTR(p) ((unsigned int *)(long)(GET(p)))
+#define PUT_PTR(p, ptr) (*(unsigned int *)(p) = ((long)ptr))
+
+/* Read the size and allocated fields from address p */
+#define GET_SIZE(p)  (GET(p) & ~0x7)
+#define GET_ALLOC(p) (GET(p) & 0x1)
+
+/* Given block ptr bp, compute address of its header and footer */
+#define HDRP(bp)       ((char *)(bp) - WSIZE)
+#define FTRP(bp)       ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+
+/* Given block ptr bp, compute address of next and previous blocks */
+#define NEXT_BLKP(bp)  ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
+#define PREV_BLKP(bp)  ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
+
+/* single word (4) or double word (8) alignment */
+#define ALIGNMENT 8
+
+/* rounds up to the nearest multiple of ALIGNMENT */
+#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
+
+#define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+
+/* number of seglists */
+#define SEGSIZE 20
+
+/* different sizes of free lists */
+#define SIZE1 (1<<2)
+#define SIZE2 (1<<3)
+#define SIZE3 (1<<4)
+#define SIZE4 (1<<5)
+#define SIZE5 (1<<6)
+#define SIZE6 (1<<7)
+#define SIZE7 (1<<8)        
+#define SIZE8 (1<<9)
+#define SIZE9 (1<<10)
+#define SIZE10 (1<<11)
+#define SIZE11 (1<<12)
+#define SIZE12 (1<<13)
+#define SIZE13 (1<<14)
+#define SIZE14 (1<<15)
+#define SIZE15 (1<<16)
+#define SIZE16 (1<<17)
+#define SIZE17 (1<<18) 
+#define SIZE18 (1<<19)
+#define SIZE19 (1<<20)      
+
+/* global variables */
+static char *heap_listp;
+
+/* functions definitions*/
+static void *extend_heap(size_t words);
+static void *coalesce(void *bp);
+static void *bestFitSearch(size_t size);
+static void addlist(void *bp);
+static void place(void *bp, size_t size);
+static void rmlist(void *bp);
+static int listNum(size_t size);
+static int mm_check(void);
+
+/* 
+ * mm_init - Allocate initial heap area and return -1 if there
+ *           was a problem in performing initialization and 
+ *           return 0 otherwise. Pointers to each size class of 
+ *           seglists will be placed at the start of the heap.
+ *           Then construct prologue and epilogue block.
+ */
+int mm_init(void)
+{
+    int i;
+
+    /* create initial empty heap */
+    if((heap_listp = mem_sbrk(SEGSIZE * WSIZE + 4*WSIZE)) == (void *)-1){
+        return -1;
+    }
+
+    /* put pointers of free lists at the beginning */
+    for(i = 0; i < SEGSIZE; i++){
+        PUT_PTR(heap_listp + WSIZE * i, NULL);
+    }
+
+    /* alignment padding */
+    PUT(heap_listp + WSIZE * SEGSIZE, 0);
+    /* prologue header */
+    PUT(heap_listp + WSIZE * SEGSIZE + WSIZE, PACK(OVERHEAD, 1));
+    /* prologue footer */
+    PUT(heap_listp + WSIZE * SEGSIZE + DSIZE, PACK(OVERHEAD, 1));
+    /* epilogue header */
+    PUT(heap_listp + WSIZE * SEGSIZE + WSIZE + DSIZE, PACK(0, 1));
+   
+    /* extend heap with a free block of CHUNKSIZE bytes */
+    if(extend_heap(CHUNKSIZE/WSIZE) == NULL){
+        return -1;
+    }
+    return 0;
+}
+
+
+/* 
+ * mm_malloc - Allocate a block and return a pointer to the allocated block
+ *             with payload of at least given size. Extend the heap if necessary.
+ *             Block size is adjusted to meet alignment requirement.
+ */
+void *mm_malloc(size_t size)
+{
+    size_t asize;     /* adjusted block size */
+    size_t extend_size;     /* amount to extend heap if no fit */
+    char *bp;        /* pointer to be returned */
+
+    /* ignore spurious requests if size is invalid */
+    if(size <= 0){
+        return NULL;
+    }
+
+    /* adjust block size to include overhead and alignment requirements */
+    if(size <= DSIZE){
+        asize = DSIZE + OVERHEAD;
+    }else{
+        asize = DSIZE * ((size + (OVERHEAD) + (DSIZE - 1)) / DSIZE);
+    }
+
+    /* search seglist for a fit */
+    if((bp = bestFitSearch(asize)) != NULL){
+        place(bp, asize);
+        return bp;
+    }
+
+    /* no fit found, get more memory and place the block */
+    extend_size = MAX(asize, CHUNKSIZE);
+    if((bp = extend_heap(extend_size / WSIZE)) == NULL){
+        return NULL;
+    }else{
+        place(bp, asize);
+        return bp;
+    }
+}
+
+/*
+ * mm_free - Free the block pointed by ptr.
+ *           Then perform coalescing.
+ */
+void mm_free(void *ptr)
+{
+    size_t size = GET_SIZE(HDRP(ptr));
+    /* update header and footer to set it free */
+    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(FTRP(ptr), PACK(size, 0));
+    coalesce(ptr);
+}
+
+/*
+ * mm_realloc - Return a pointer to the reallocated region of size
+ *              at least given size with the following rules:
+ *              1) if ptr is NULL, equivalent to mm_malloc(size)
+ *              2) if size=0, equivalent to mm_free(ptr)
+ *              3) otherwise, change the size of the old block using
+ *                 the given size and return the address of new block            
+ */
+void *mm_realloc(void *ptr, size_t size)
+{
+    void *oldptr = ptr;  /* pointer to old block */
+    void *newptr;      /* pointer to be returned */
+    size_t asize;   /* adjusted size */
+    
+    /* equivalent to malloc(size) if ptr is NULL */
+    if(ptr == NULL){
+        newptr = mm_malloc(size);
+        return newptr;
+    }
+    
+    /* equivalent to free(ptr) if size is 0 */
+    if(size == 0){
+        mm_free(oldptr);
+        return NULL;
+    }
+    
+    /* adjust the block size for alignment */
+    if(size <= DSIZE){
+        asize = 2 * DSIZE;
+    }else{
+        asize = DSIZE * (size + OVERHEAD + (DSIZE - 1) / DSIZE);
+    }
+    
+    /* no need to find newptr */
+    if(asize == GET_SIZE(HDRP(oldptr))){
+        return oldptr;
+    }
+    /* allocate new block and free old block */
+    else{
+        newptr = mm_malloc(size);
+        /* return NULL if malloc fails */
+        if(newptr == NULL){
+            return NULL;
+        }
+        memcpy(newptr, oldptr, size);
+        mm_free(oldptr);
+        return newptr;
+    }
+}
+
+
+
+/*
+ * extend_heap - Extend the heap and update block information.
+ */
+
+static void *extend_heap(size_t words)
+{
+    char *bp;
+    size_t size;
+
+    /* allocate even number of words for alignment */
+    size = (words % 2) ? ((words + 1) * WSIZE) : (words * WSIZE);
+    
+    /* extend the heap */
+    if((long)(bp = mem_sbrk(size)) == -1){
+        return NULL;
+    }
+
+    /* initialize header and footer of free block */
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+
+    /* new epilogue header */
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
+
+    /* coalesce if previous block was free */
+    return coalesce(bp);
+}
+
+/*
+ * coalesce - Coalesce adjacent free blocks and insert it
+ *            into corresponding seglist.
+ */
+static void *coalesce(void *bp)
+{
+    /* test if prev/next block is allocated */
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    size_t size = GET_SIZE(HDRP(bp));
+    
+    /* only next block is free */
+    if(prev_alloc && !next_alloc){
+       rmlist(NEXT_BLKP(bp));
+       size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+       PUT(HDRP(bp), PACK(size, 0));
+       PUT(FTRP(bp), PACK(size, 0));
+    }
+    /* only prev block is free */
+    else if(!prev_alloc && next_alloc){
+       rmlist(PREV_BLKP(bp));
+       size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+       PUT(FTRP(bp), PACK(size, 0));
+       PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+       bp = PREV_BLKP(bp);
+       
+    }
+    /* both prev and next block are free */
+    else if(!prev_alloc && !next_alloc){
+       rmlist(PREV_BLKP(bp));
+       rmlist(NEXT_BLKP(bp));
+       size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
+       PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+       PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+       bp = PREV_BLKP(bp);
+    }
+    /* insert free block into corresponding seglist */
+    addlist(bp);
+    return bp;
+}
+
+/*
+ * listNum - Find the corresponding size class of the given size.
+ */
+static int listNum(size_t size)
+{
+    /* use binary search on the first two layers to speed up */
+    if(size <= SIZE10){
+        if(size <= SIZE5){
+           if(size <= SIZE1){
+               return 0;
+           }else if(size <=SIZE2){
+               return 1;
+           }else if(size <= SIZE3){
+               return 2;
+           }else if(size <= SIZE4){
+               return 3;
+           }else{
+               return 4;
+           }
+        }else{
+           if(size <= SIZE6){
+               return 5;
+           }else if(size <= SIZE7){
+               return 6;
+           }else if(size <= SIZE8){
+               return 7;
+           }else if(size <= SIZE9){
+               return 8;
+           }else{
+               return 9;
+           }
+        }
+    }else{
+        if(size <= SIZE15){
+           if(size <= SIZE11){
+               return 10;
+           }else if(size <= SIZE12){
+               return 11;
+           }else if(size <= SIZE13){
+               return 12;
+           }else if(size <= SIZE14){
+               return 13;
+           }else{
+               return 14;
+           }
+        }else{
+            if(size <= SIZE16){
+                return 15;
+            }else if(size <= SIZE17){
+                return 16;
+            }else if(size <= SIZE18){
+                return 17;
+            }else if(size <= SIZE19){
+                return 18;
+            }else{
+                return 19;
+            }
+        }
+    }    
+}
+
+/*
+ * addlist - Insert a block pointer into corresponding seglist.
+ */
+static void addlist(void *bp)
+{   
+    /* get size of free block */
+    size_t size;
+    size = GET_SIZE(HDRP(bp));
+
+    /* get correponding size class */
+    int classNum;
+    classNum = listNum(size);  
+
+    /* get the pointer to next block in the list*/
+    unsigned int *ptr;
+    ptr = (unsigned int *)bp + 1;
+
+    /* get corresponding seglist */
+    char *fitclass;
+    fitclass = heap_listp + classNum * WSIZE;
+
+    /* first block to insert in the seglist */
+    if(GET_PTR(fitclass) == NULL){
+        PUT_PTR(fitclass, bp);
+        PUT_PTR(bp, NULL);
+        PUT_PTR(ptr, NULL);
+    }
+    /* normal case */
+    else{
+        PUT_PTR(bp, GET_PTR(fitclass));
+        PUT_PTR(GET_PTR(fitclass) + 1, bp);   
+        PUT_PTR(ptr, NULL);
+        PUT_PTR(fitclass, bp);
+    }
+}
+
+/*
+ * rmlist - Remove a pointer to free block from the seglist.
+ */
+static void rmlist(void *bp){
+    size_t size;
+    size = GET_SIZE(HDRP(bp));
+    
+    /* get corresponding size class */
+    int classNum;
+    classNum = listNum(size);
+    
+    /* get the pointer to next block in the list */
+    unsigned int *ptr;
+    ptr = (unsigned int *)bp + 1;
+
+    /* get corresponding seglist */
+    char *fitclass;
+    fitclass = heap_listp + classNum * WSIZE;
+
+    /* the only block in the seglist */
+    if(GET_PTR(bp)==NULL && GET_PTR(ptr)==NULL){
+        PUT_PTR(fitclass, NULL);
+    }
+
+    /* the last element in the seglist, but not the only one */
+    else if(GET_PTR(bp)==NULL && GET_PTR(ptr)!=NULL){
+        PUT_PTR(GET_PTR(ptr), NULL);
+    }
+
+    /* the first element in the seglist, but not the only one */
+    else if(GET_PTR(bp)!=NULL && GET_PTR(ptr)==NULL){
+        PUT_PTR(fitclass, GET_PTR(bp));
+        PUT_PTR(GET_PTR(bp) + 1, NULL);
+    }
+
+    /* intermediate element */
+    else{
+        PUT_PTR(GET_PTR(ptr), GET_PTR(bp));
+        PUT_PTR(GET_PTR(bp) + 1, GET_PTR(ptr));
+    }
+}
+
+/*
+ * bestFitSearch - Find a fit for the given size in the seglist.
+ */
+static void *bestFitSearch (size_t size)
+{
+    /* get correponding size class */
+    int classNum;
+    classNum = listNum(size);
+
+    /* pointer used to traverse the list */
+    unsigned int *curr;
+    /* pointer to store the best fit */
+    unsigned int *bestfit;
+    bestfit = NULL;
+ 
+    while(classNum < SEGSIZE){
+        curr = GET_PTR(heap_listp + classNum * WSIZE);
+        /* search through the size class for a fit */
+        while(curr != NULL){
+            if(GET_SIZE(HDRP(curr)) >= size){
+                /* initialize best fit result */
+                if(bestfit == NULL){
+                    bestfit = curr;
+                }
+                else{
+                    /* update best fit result if a smaller size is found */
+                    if(GET_SIZE(HDRP(curr)) < GET_SIZE(HDRP(bestfit))){
+                        bestfit = curr;
+                    }
+                }
+                curr = GET_PTR(curr);
+            }
+            /* go to next spot */
+            else{
+                curr = GET_PTR(curr);
+            }
+        }
+        /* if best fit found in current list, return it */
+        if(bestfit != NULL){
+            return (void *)bestfit;
+        }
+        /* go to next size class if no fit */
+        classNum ++;
+    }
+    return NULL;
+} 
+
+/*
+ * place - Place the requested block starting from the beginning of free block
+ *         Split the block if enough free space remains
+ */
+static void place (void *bp, size_t size)
+{   
+    /* get size of given block */
+    size_t blksize = GET_SIZE(HDRP(bp));
+    /* remove the free block from seglist */
+    rmlist(bp);
+    
+    /* compute size difference */
+    size_t diff;
+    diff = blksize - size;
+
+    /* enough additional free space found, add it to seglist of correponding size */
+    if((diff) >= 2 * DSIZE){
+        PUT(HDRP(bp), PACK(size, 1));
+        PUT(FTRP(bp), PACK(size, 1));
+        PUT(HDRP(NEXT_BLKP(bp)), PACK(diff, 0));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(diff, 0));
+        addlist(NEXT_BLKP(bp));
+    }
+
+    /* no enough additional free space */
+    else{
+        PUT(HDRP(bp), PACK(blksize, 1));
+        PUT(FTRP(bp), PACK(blksize, 1));
+    }
+}
+
+
+/*
+ * mm_check - Check heap consistency for the following conditions
+ *            1) check if heap lower/bound is consistent with heap size
+ *            2) check if pointer is within the heap range
+ *            3) check if any contiguous free blocks escape coalescing
+ *            4) check if every free block is in the free list
+ *            5) check if alignment requirement is met
+ *            6) check if every block in the seglists is marked as free
+ *            Error messages will be printed if any condition fails.
+ * 
+ *            Return a nonzero value(1) if and only if the heap is consistent
+ *            Otherwise, return -1
+ *
+ */
+static int mm_check(void)
+ {
+
+    void *temp;     /* temporary pointer */
+
+    /* get the boundary of the heap */
+    size_t *heap_lo = mem_heap_lo();
+    size_t *heap_hi = mem_heap_hi();
+
+    /* use 1 for consistency and -1 otherwise */
+    int consistency = 1;
+    
+    /* check the consistency of heap boundary */
+    if(heap_hi >= (heap_lo + mem_heapsize())){
+        printf("ERROR: Inconsistency in heap boundary\n");
+        consistency = -1;
+    }
+
+    /* go through the heap */
+    for(temp = heap_lo; GET_SIZE(HDRP(temp))>0; temp = NEXT_BLKP(temp)){
+        /* check if pointer is within the heap */
+        if((int)temp > (int)heap_hi || (int)temp < (int)heap_lo){
+            printf("ERROR: Pointer is not within the heap\n");
+            printf("Pointer Info: %p\n", temp);
+            consistency = -1;
+        }
+
+        /* check if contiguous free blocks not coalesced */
+        if(GET_ALLOC(HDRP(temp))==0 && GET_ALLOC(HDRP(NEXT_BLKP(temp)))==0){
+            if(temp != heap_lo){
+                printf("ERROR: Contiguous free blocks not coalesced.\n");
+                printf("Pointer Info: %p\n", temp);
+                consistency = -1;
+            }
+        }
+        
+        /* check if every free block is in the free list */
+        if(GET_ALLOC(HDRP(temp))==0){
+            /* find the size class to start with */
+            int classNum;
+            classNum = listNum(GET_SIZE(HDRP(temp)));
+            unsigned int *curr;
+            unsigned int blk_size;
+            blk_size = GET_SIZE(HDRP(temp));
+
+            /* go through each seglist */
+            while(classNum < SEGSIZE){
+                curr = GET_PTR(heap_listp + classNum * WSIZE);
+                while(curr != NULL){
+                    /* go to next block if size doesn't match */
+                    if(GET_SIZE(HDRP(curr)) != blk_size){
+                        curr = GET_PTR(curr);
+                    }
+                    /* if find match, set classNum=100 to exit the loop */
+                    else{
+                        classNum = 100;
+                    }
+                }
+                classNum ++;
+            }
+
+            /* print error if no matched block found during the traversal */
+            if(classNum != 100 && temp!=heap_lo){
+                printf("ERROR: Free block not found in the free list\n");
+                printf("Pointer Info: %p\n", temp);
+                consistency = -1;
+            }
+        }
+
+        /* check alignment requirement */
+        if((size_t)temp % ALIGNMENT){
+            printf("ERROR: Alignment requirement not met\n");
+            printf("Pointer Info: %p\n", temp);
+            consistency = -1;
+        }
+
+
+    }
+
+    unsigned int *curr;
+    int i;
+    /* go through the seglists and check if every block is marked as free */
+    for(i = 0; i < SEGSIZE; i++){
+        curr = GET_PTR(heap_listp + i * WSIZE);
+        while(curr != NULL){
+            if(GET_ALLOC(HDRP(curr))){
+                printf("ERROR: Block in the free list not marked as free\n");
+                printf("Size class number: %d\n", i);
+                consistency = -1;
+            }
+            curr = GET_PTR(curr);
+        }
+    }
+
+    return consistency;
+ }
+
+
